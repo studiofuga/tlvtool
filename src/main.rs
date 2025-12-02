@@ -11,6 +11,11 @@ use std::io::{self, Read};
         .args(["file", "binary", "hex"]) // at most one of these three should be used
         .multiple(false)
 ))]
+#[command(group(
+    ArgGroup::new("output_format")
+        .args(["output_hex", "output_ascii", "output_stream"])
+        .multiple(false)
+))]
 struct Args {
     /// Read hex string from file path
     #[arg(short = 'f', long = "file", value_name = "PATH", conflicts_with = "binary")]
@@ -27,6 +32,25 @@ struct Args {
     /// Extract specific tag path (e.g., "6F/A5/BF0C" or "6F,A5,BF0C" or "6F-A5-BF0C")
     #[arg(short = 'x', long = "extract", value_name = "TAG_PATH")]
     extract: Option<String>,
+
+    /// Output data as hex bytes separated by spaces
+    #[arg(long = "hex")]
+    output_hex: bool,
+
+    /// Output data as ASCII dump (hex + ASCII side by side, default for normal mode)
+    #[arg(long = "ascii")]
+    output_ascii: bool,
+
+    /// Output data as continuous hex stream (default for extract mode)
+    #[arg(long = "stream")]
+    output_stream: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OutputFormat {
+    Hex,     // Hex with spaces: "01 02 03 04"
+    Ascii,   // Hex + ASCII dump (like bytes_to_hex)
+    Stream,  // Continuous hex: "01020304"
 }
 
 fn parse_tag_path(path: &str) -> Result<Vec<Vec<u8>>, String> {
@@ -87,30 +111,56 @@ fn extract_tlv_by_path<'a>(tlv: &'a Tlv, path: &[Vec<u8>]) -> Option<&'a Tlv> {
     None
 }
 
-fn tlv_value_to_hex(tlv: &Tlv) -> String {
+fn get_tlv_value_bytes(tlv: &Tlv) -> Vec<u8> {
     match tlv.value() {
-        Value::Primitive(data) => {
-            data.iter()
-                .map(|b| format!("{:02X}", b))
-                .collect::<Vec<String>>()
-                .join("")
-        }
+        Value::Primitive(data) => data.to_vec(),
         Value::Constructed(nested_tlvs) => {
             // For constructed values, return the raw encoding of all nested TLVs
             let mut result = Vec::new();
             for nested_tlv in nested_tlvs {
                 result.extend_from_slice(&nested_tlv.to_vec());
             }
-            result.iter()
+            result
+        }
+    }
+}
+
+fn format_bytes(bytes: &[u8], format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Stream => {
+            // Continuous hex stream: "01020304"
+            bytes.iter()
                 .map(|b| format!("{:02X}", b))
                 .collect::<Vec<String>>()
                 .join("")
+        }
+        OutputFormat::Hex => {
+            // Hex with spaces: "01 02 03 04"
+            bytes.iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<String>>()
+                .join(" ")
+        }
+        OutputFormat::Ascii => {
+            // ASCII dump (hex + ASCII side by side)
+            bytes_to_hex("", bytes)
         }
     }
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Check if user explicitly specified a format
+    let explicit_format = if args.output_hex {
+        Some(OutputFormat::Hex)
+    } else if args.output_ascii {
+        Some(OutputFormat::Ascii)
+    } else if args.output_stream {
+        Some(OutputFormat::Stream)
+    } else {
+        None
+    };
 
     // Decide the source of bytes according to the rules:
     // -b <path> → read raw bytes from file
@@ -164,6 +214,8 @@ fn main() {
 
     if let Some(ref path) = tag_path {
         // Extract mode: parse all TLVs and search for the tag path
+        // Default to Stream format if not explicitly specified
+        let output_format = explicit_format.unwrap_or(OutputFormat::Stream);
         let mut current_stream = stream.as_slice();
         let mut found = false;
 
@@ -176,7 +228,8 @@ fn main() {
 
             let tlv = tlv.unwrap();
             if let Some(extracted) = extract_tlv_by_path(&tlv, path) {
-                println!("{}", tlv_value_to_hex(extracted));
+                let bytes = get_tlv_value_bytes(extracted);
+                println!("{}", format_bytes(&bytes, output_format));
                 found = true;
                 break;
             }
@@ -193,6 +246,8 @@ fn main() {
         }
     } else {
         // Normal mode: print all TLVs
+        // Default to Ascii format if not explicitly specified (preserves original behavior)
+        let output_format = explicit_format.unwrap_or(OutputFormat::Ascii);
         let mut current_stream = stream.as_slice();
         loop {
             let (tlv, remaining) = Tlv::parse(current_stream);
@@ -200,7 +255,7 @@ fn main() {
                 eprintln!("Failed to parse TLV: {}", e);
                 break;
             }
-            print_tlv(&tlv.unwrap(), 0);
+            print_tlv(&tlv.unwrap(), 0, output_format);
             if remaining.is_empty() {
                 break;
             }
@@ -244,7 +299,7 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn print_tlv(tlv: &Tlv, indent: usize) {
+fn print_tlv(tlv: &Tlv, indent: usize, format: OutputFormat) {
     let prefix = "  ".repeat(indent);
 
     println!("{}Tag: {:?}", prefix, tlv.tag());
@@ -252,13 +307,21 @@ fn print_tlv(tlv: &Tlv, indent: usize) {
 
     match tlv.value() {
         Value::Primitive(data) => {
-            println!("{}Value: \n{}", prefix, bytes_to_hex(&"  ".repeat(indent+2), data));
+            let formatted = format_bytes(data, format);
+            match format {
+                OutputFormat::Ascii => {
+                    println!("{}Value: \n{}", prefix, bytes_to_hex(&"  ".repeat(indent+2), data));
+                }
+                OutputFormat::Hex | OutputFormat::Stream => {
+                    println!("{}Value: {}", prefix, formatted);
+                }
+            }
         }
         Value::Constructed(nested_tlvs) => {
             println!("{}Value: [Constructed]", prefix);
             for (i, nested_tlv) in nested_tlvs.iter().enumerate() {
                 println!("{}  Nested TLV {}:", prefix, i + 1);
-                print_tlv(nested_tlv, indent + 2);
+                print_tlv(nested_tlv, indent + 2, format);
             }
         }
     }
