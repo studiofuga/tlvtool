@@ -44,6 +44,10 @@ struct Args {
     /// Output data as continuous hex stream (default for extract mode)
     #[arg(long = "stream")]
     output_stream: bool,
+
+    /// Display only the tree structure of tags (no lengths or values)
+    #[arg(long = "tree")]
+    tree: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -246,20 +250,38 @@ fn main() {
         }
     } else {
         // Normal mode: print all TLVs
-        // Default to Ascii format if not explicitly specified (preserves original behavior)
-        let output_format = explicit_format.unwrap_or(OutputFormat::Ascii);
         let mut current_stream = stream.as_slice();
-        loop {
-            let (tlv, remaining) = Tlv::parse(current_stream);
-            if let Err(e) = tlv {
-                eprintln!("Failed to parse TLV: {}", e);
-                break;
+
+        if args.tree {
+            // Tree mode: only show tag hierarchy
+            loop {
+                let (tlv, remaining) = Tlv::parse(current_stream);
+                if let Err(e) = tlv {
+                    eprintln!("Failed to parse TLV: {}", e);
+                    break;
+                }
+                print_tlv_tree(&tlv.unwrap(), Vec::new());
+                if remaining.is_empty() {
+                    break;
+                }
+                current_stream = remaining;
             }
-            print_tlv(&tlv.unwrap(), 0, output_format);
-            if remaining.is_empty() {
-                break;
+        } else {
+            // Normal mode with full details
+            // Default to Ascii format if not explicitly specified (preserves original behavior)
+            let output_format = explicit_format.unwrap_or(OutputFormat::Ascii);
+            loop {
+                let (tlv, remaining) = Tlv::parse(current_stream);
+                if let Err(e) = tlv {
+                    eprintln!("Failed to parse TLV: {}", e);
+                    break;
+                }
+                print_tlv(&tlv.unwrap(), 0, output_format);
+                if remaining.is_empty() {
+                    break;
+                }
+                current_stream = remaining;
             }
-            current_stream = remaining;
         }
     }
 }
@@ -297,6 +319,28 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     }
 
     Ok(bytes)
+}
+
+fn print_tlv_tree(tlv: &Tlv, path: Vec<String>) {
+    // Format tag as hex string
+    let tag_bytes = tlv.tag().to_bytes();
+    let tag_hex = tag_bytes.iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<String>();
+
+    // Build the full path by appending current tag
+    let mut current_path = path.clone();
+    current_path.push(tag_hex);
+
+    // Print the full path
+    println!("{}", current_path.join("/"));
+
+    // If constructed, recursively print nested tags with the current path
+    if let Value::Constructed(nested_tlvs) = tlv.value() {
+        for nested_tlv in nested_tlvs {
+            print_tlv_tree(nested_tlv, current_path.clone());
+        }
+    }
 }
 
 fn print_tlv(tlv: &Tlv, indent: usize, format: OutputFormat) {
