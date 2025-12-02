@@ -23,6 +23,90 @@ struct Args {
     /// Hex string provided directly on the command line (no flags)
     #[arg(value_name = "HEX", required = false)]
     hex: Option<String>,
+
+    /// Extract specific tag path (e.g., "6F/A5/BF0C" or "6F,A5,BF0C" or "6F-A5-BF0C")
+    #[arg(short = 'x', long = "extract", value_name = "TAG_PATH")]
+    extract: Option<String>,
+}
+
+fn parse_tag_path(path: &str) -> Result<Vec<Vec<u8>>, String> {
+    // Split by comma, slash, or dash
+    let parts: Vec<&str> = path
+        .split(|c| c == ',' || c == '/' || c == '-')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut tags = Vec::new();
+    for part in parts {
+        let tag_bytes = hex_to_bytes(part)?;
+        if tag_bytes.is_empty() {
+            return Err(format!("Empty tag in path: {}", part));
+        }
+        tags.push(tag_bytes);
+    }
+
+    Ok(tags)
+}
+
+fn extract_tlv_by_path<'a>(tlv: &'a Tlv, path: &[Vec<u8>]) -> Option<&'a Tlv> {
+    if path.is_empty() {
+        return Some(tlv);
+    }
+
+    // Check if current TLV matches the first tag in path
+    let current_tag = &path[0];
+    let tlv_tag_bytes = tlv.tag().to_bytes();
+
+    if tlv_tag_bytes == current_tag.as_slice() {
+        // Tag matches, continue with remaining path
+        if path.len() == 1 {
+            // This is the final tag in the path
+            return Some(tlv);
+        }
+
+        // Need to go deeper, check if this is constructed
+        if let Value::Constructed(nested_tlvs) = tlv.value() {
+            for nested_tlv in nested_tlvs {
+                if let Some(found) = extract_tlv_by_path(nested_tlv, &path[1..]) {
+                    return Some(found);
+                }
+            }
+        }
+        return None;
+    }
+
+    // Current TLV doesn't match, but if it's constructed, search within
+    if let Value::Constructed(nested_tlvs) = tlv.value() {
+        for nested_tlv in nested_tlvs {
+            if let Some(found) = extract_tlv_by_path(nested_tlv, path) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+fn tlv_value_to_hex(tlv: &Tlv) -> String {
+    match tlv.value() {
+        Value::Primitive(data) => {
+            data.iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<String>>()
+                .join("")
+        }
+        Value::Constructed(nested_tlvs) => {
+            // For constructed values, return the raw encoding of all nested TLVs
+            let mut result = Vec::new();
+            for nested_tlv in nested_tlvs {
+                result.extend_from_slice(&nested_tlv.to_vec());
+            }
+            result.iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<String>>()
+                .join("")
+        }
+    }
 }
 
 fn main() {
@@ -63,16 +147,64 @@ fn main() {
         }
     };
 
-    let stream = bytes.iter();
-    loop {
-        let (tlv, stream) = Tlv::parse(stream.as_slice());
-        if let Err(e) = tlv {
-            eprintln!("Failed to parse TLV: {}", e);
-            break;
+    // Parse the tag path if extract mode is enabled
+    let tag_path = if let Some(ref extract_path) = args.extract {
+        match parse_tag_path(extract_path) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                eprintln!("Failed to parse tag path '{}': {}", extract_path, e);
+                std::process::exit(1);
+            }
         }
-        print_tlv(&tlv.unwrap(), 0);
-        if stream.is_empty() {
-            break;
+    } else {
+        None
+    };
+
+    let stream = bytes.iter();
+
+    if let Some(ref path) = tag_path {
+        // Extract mode: parse all TLVs and search for the tag path
+        let mut current_stream = stream.as_slice();
+        let mut found = false;
+
+        loop {
+            let (tlv, remaining) = Tlv::parse(current_stream);
+            if let Err(e) = tlv {
+                eprintln!("Failed to parse TLV: {}", e);
+                break;
+            }
+
+            let tlv = tlv.unwrap();
+            if let Some(extracted) = extract_tlv_by_path(&tlv, path) {
+                println!("{}", tlv_value_to_hex(extracted));
+                found = true;
+                break;
+            }
+
+            if remaining.is_empty() {
+                break;
+            }
+            current_stream = remaining;
+        }
+
+        if !found {
+            eprintln!("Tag path not found: {}", args.extract.unwrap());
+            std::process::exit(1);
+        }
+    } else {
+        // Normal mode: print all TLVs
+        let mut current_stream = stream.as_slice();
+        loop {
+            let (tlv, remaining) = Tlv::parse(current_stream);
+            if let Err(e) = tlv {
+                eprintln!("Failed to parse TLV: {}", e);
+                break;
+            }
+            print_tlv(&tlv.unwrap(), 0);
+            if remaining.is_empty() {
+                break;
+            }
+            current_stream = remaining;
         }
     }
 }
